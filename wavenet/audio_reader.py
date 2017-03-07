@@ -10,6 +10,10 @@ import tensorflow as tf
 
 FILE_PATTERN = r'p([0-9]+)_([0-9]+)\.wav'
 
+DICTIONARY = 'abcdefghijklmnopqrstuvwxyz.?!,-\' '
+BOS = len(DICTIONARY)  #beginning of sentence
+EOS = BOS + 1  #end of sentence
+
 
 def get_category_cardinality(files):
     id_reg_expression = re.compile(FILE_PATTERN)
@@ -22,8 +26,30 @@ def get_category_cardinality(files):
             min_id = id
         if max_id is None or id > max_id:
             max_id = id
-
     return min_id, max_id
+
+
+def check_characters(files):
+    min_id = None
+    max_id = None
+    for filename in files:
+        text_to_ints(open(filename[1]).read())
+
+
+def strip_text(text):
+    return text.strip().lower().replace("\"", "").replace(")", "").replace("`", "").replace("\t", "")
+
+
+def text_to_ints(text):
+    ints = []
+    ints.append(BOS)
+    for c in strip_text(text):
+        id = DICTIONARY.find(c)
+        if id < 0:
+            raise ValueError("Character not in dictionary :'{}' in '{}'.".format(c, text))
+        ints.append(id)
+    ints.append(EOS)
+    return ints
 
 
 def randomize_files(files):
@@ -32,23 +58,37 @@ def randomize_files(files):
         yield files[file_index]
 
 
-def find_files(directory, pattern='*.wav'):
-    '''Recursively finds all files matching the pattern.'''
+def find_audio_files(directory, with_text = False):
+    '''Recursively finds all wav files with corresponding text file.'''
+    dic = {}
     files = []
     for root, dirnames, filenames in os.walk(directory):
-        for filename in fnmatch.filter(filenames, pattern):
-            files.append(os.path.join(root, filename))
+        for wavname in fnmatch.filter(filenames, '*.wav'):
+            if with_text:
+                dic[wavname[:-4]] = os.path.join(root, wavname)
+            else:
+                files.append(os.path.join(root, wavname))
+    if with_text:
+        for root, dirnames, filenames in os.walk(directory):
+            for textname in fnmatch.filter(filenames, '*.txt'):
+                if textname[:-4] in dic:
+                    files.append([dic[textname[:-4]], os.path.join(root, textname)])     
     return files
 
 
-def load_generic_audio(directory, sample_rate):
+def load_generic_audio(directory, sample_rate, with_text = False):
     '''Generator that yields audio waveforms from the directory.'''
-    files = find_files(directory)
+    files = find_audio_files(directory, with_text)
     id_reg_exp = re.compile(FILE_PATTERN)
     print("files length: {}".format(len(files)))
     randomized_files = randomize_files(files)
     for filename in randomized_files:
-        ids = id_reg_exp.findall(filename)
+        text = ""
+        wavname = filename
+        if with_text:
+            wavname = filename[0]
+            text = open(filename[1]).read()
+        ids = id_reg_exp.findall(wavname)
         if not ids:
             # The file name does not match the pattern containing ids, so
             # there is no id.
@@ -56,9 +96,9 @@ def load_generic_audio(directory, sample_rate):
         else:
             # The file name matches the pattern for containing ids.
             category_id = int(ids[0][0])
-        audio, _ = librosa.load(filename, sr=sample_rate, mono=True)
+        audio, _ = librosa.load(wavname, sr=sample_rate, mono=True)
         audio = audio.reshape(-1, 1)
-        yield audio, filename, category_id
+        yield audio, wavname, category_id, text
 
 
 def trim_silence(audio, threshold):
@@ -91,6 +131,7 @@ class AudioReader(object):
                  coord,
                  sample_rate,
                  gc_enabled,
+                 lc_enabled,
                  receptive_field,
                  sample_size=None,
                  silence_threshold=None,
@@ -102,6 +143,7 @@ class AudioReader(object):
         self.receptive_field = receptive_field
         self.silence_threshold = silence_threshold
         self.gc_enabled = gc_enabled
+        self.lc_enabled = lc_enabled
         self.threads = []
         self.sample_placeholder = tf.placeholder(dtype=tf.float32, shape=None)
         self.queue = tf.PaddingFIFOQueue(queue_size,
@@ -115,12 +157,21 @@ class AudioReader(object):
                                                 shapes=[()])
             self.gc_enqueue = self.gc_queue.enqueue([self.id_placeholder])
 
+        if self.lc_enabled:
+            self.text_placeholder = tf.placeholder(dtype=tf.int32, shape=None)
+            self.lc_queue = tf.PaddingFIFOQueue(queue_size, ['int32'],
+                                                shapes=[[None]])
+            self.lc_enqueue = self.lc_queue.enqueue([self.text_placeholder])
+
         # TODO Find a better way to check this.
         # Checking inside the AudioReader's thread makes it hard to terminate
         # the execution of the script, so we do it in the constructor for now.
-        files = find_files(audio_dir)
+        files = find_audio_files(audio_dir, self.lc_enabled)
         if not files:
-            raise ValueError("No audio files found in '{}'.".format(audio_dir))
+            if self.lc_enabled:
+                raise ValueError("No audio files with associated text found in '{}'. Please check that for every .wav file there exists a .txt file with the same name".format(audio_dir))
+            else:
+                raise ValueError("No audio files found in '{}'.".format(audio_dir))
         if self.gc_enabled and not_all_have_id(files):
             raise ValueError("Global conditioning is enabled, but file names "
                              "do not conform to pattern having id.")
@@ -141,6 +192,13 @@ class AudioReader(object):
         else:
             self.gc_category_cardinality = None
 
+        if self.lc_enabled:
+            check_characters(files)
+            self.lc_character_cardinality = len(DICTIONARY) + 2
+            print("Dictionary cardinality={}".format(
+                  self.lc_character_cardinality))
+
+
     def dequeue(self, num_elements):
         output = self.queue.dequeue_many(num_elements)
         return output
@@ -148,12 +206,15 @@ class AudioReader(object):
     def dequeue_gc(self, num_elements):
         return self.gc_queue.dequeue_many(num_elements)
 
+    def dequeue_lc(self, num_elements):
+        return self.lc_queue.dequeue_many(num_elements)
+
     def thread_main(self, sess):
         stop = False
         # Go through the dataset multiple times
         while not stop:
-            iterator = load_generic_audio(self.audio_dir, self.sample_rate)
-            for audio, filename, category_id in iterator:
+            iterator = load_generic_audio(self.audio_dir, self.sample_rate, self.lc_enabled)
+            for audio, wavname, category_id, text in iterator:               
                 if self.coord.should_stop():
                     stop = True
                     break
@@ -165,7 +226,7 @@ class AudioReader(object):
                         print("Warning: {} was ignored as it contains only "
                               "silence. Consider decreasing trim_silence "
                               "threshold, or adjust volume of the audio."
-                              .format(filename))
+                              .format(wavname))
 
                 audio = np.pad(audio, [[self.receptive_field, 0], [0, 0]],
                                'constant')
@@ -188,6 +249,11 @@ class AudioReader(object):
                     if self.gc_enabled:
                         sess.run(self.gc_enqueue,
                                  feed_dict={self.id_placeholder: category_id})
+                    if self.lc_enabled:
+                        sess.run(self.lc_enqueue,
+                                 feed_dict={self.text_placeholder: text_to_ints(text)})
+                print strip_text(text)
+
 
     def start_threads(self, sess, n_threads=1):
         for _ in range(n_threads):

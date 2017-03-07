@@ -56,7 +56,10 @@ class WaveNetModel(object):
                  initial_filter_width=32,
                  histograms=False,
                  global_condition_channels=None,
-                 global_condition_cardinality=None):
+                 global_condition_cardinality=None,
+                 local_condition_cardinality=None,
+                 local_condition_channels=None,
+                 local_condition_gaussians=None):
         '''Initializes the WaveNet model.
 
         Args:
@@ -93,6 +96,13 @@ class WaveNetModel(object):
                 categories, where N = global_condition_cardinality. If None,
                 then the global_condition tensor is regarded as a vector which
                 must have dimension global_condition_channels.
+            local_condition_cardinality: Size of character dictionary for 
+                local condition.
+            local_condition_channels: Number of channels in (embedding
+                size) of local conditioning characters. None indicates there is
+                no local conditioning.
+            local_condition_gaussians: Number of gaussians to be used for
+                computing local conditioning weights.
 
         '''
         self.batch_size = batch_size
@@ -108,6 +118,9 @@ class WaveNetModel(object):
         self.histograms = histograms
         self.global_condition_channels = global_condition_channels
         self.global_condition_cardinality = global_condition_cardinality
+        self.local_condition_cardinality = local_condition_cardinality
+        self.local_condition_channels = local_condition_channels
+        self.local_condition_gaussians = local_condition_gaussians
 
         self.receptive_field = WaveNetModel.calculate_receptive_field(
             self.filter_width, self.dilations, self.scalar_input,
@@ -145,6 +158,17 @@ class WaveNetModel(object):
                         'gc_embedding',
                         [self.global_condition_cardinality,
                          self.global_condition_channels])
+                    var['embeddings'] = layer
+            
+            if self.local_condition_cardinality is not None:
+                with tf.variable_scope('embeddings'):
+                    layer = dict()
+                    if 'embeddings' in var:
+                        layer = var['embeddings']
+                    layer['lc_embedding'] = create_embedding_table(
+                        'lc_embedding',
+                        [self.local_condition_cardinality,
+                         self.local_condition_channels])
                     var['embeddings'] = layer
 
             with tf.variable_scope('causal_layer'):
@@ -188,6 +212,13 @@ class WaveNetModel(object):
                              self.dilation_channels,
                              self.skip_channels])
 
+                        #if self.local_condition_cardinality is not None:
+                        #    current['lc_weights'] = create_variable(
+                        #    	'lc_weights',
+                        #    	[1,
+                        #     	 self.residual_channels,
+                        #     	 3*self.local_condition_gaussians])
+
                         if self.global_condition_channels is not None:
                             current['gc_gateweights'] = create_variable(
                                 'gc_gate',
@@ -213,6 +244,20 @@ class WaveNetModel(object):
                                 [self.skip_channels])
 
                         var['dilated_stack'].append(current)
+
+            if self.local_condition_cardinality is not None:
+                with tf.variable_scope('lc_layer'):
+                    current = dict()
+                    current['lc_gaussian_weights'] = create_variable(
+                        'lc_gaussian_weights',
+                        [1,
+                         self.skip_channels,
+                         3*self.local_condition_gaussians])                 
+                    if self.use_biases:
+                        current['lc_gaussian_biases'] = create_bias_variable(
+                            'lc_gaussian_biases', 
+                            [3*self.local_condition_gaussians])
+                    var['lc_layer'] = current
 
             with tf.variable_scope('postprocessing'):
                 current = dict()
@@ -335,6 +380,42 @@ class WaveNetModel(object):
 
         return skip_contribution, input_batch + transformed
 
+    def _create_lc_layer(self, input_batch, local_condition_batch):
+        lc_weights = self.variables['lc_layer']['lc_gaussian_weights']
+        if self.use_biases:
+            lc_biases = self.variables['lc_layer']['lc_gaussian_biases']
+        transformed1 = tf.nn.relu(input_batch)
+        raw_params = tf.nn.conv1d(transformed1, lc_weights, stride=1, padding="SAME")
+        if self.use_biases:
+            raw_params += lc_biases
+        raw_params = tf.reshape(raw_params, [-1, 3*self.local_condition_gaussians])
+        raw_params = tf.exp(raw_params)
+        alphas = tf.slice(
+            raw_params,
+            [0, 0],
+            [-1, self.local_condition_gaussians])
+        betas = tf.slice(
+            raw_params,
+            [0, self.local_condition_gaussians + 1],
+            [-1, self.local_condition_gaussians])
+        kappas = tf.slice(
+            raw_params,
+            [0, 2*self.local_condition_gaussians + 1],
+            [-1, self.local_condition_gaussians])
+        alphas = tf.reshape(alphas, [self.batch_size, -1, self.local_condition_gaussians])
+        betas = tf.reshape(betas, [self.batch_size, -1, self.local_condition_gaussians])
+        kappas = tf.reshape(alphas, [self.batch_size, -1, self.local_condition_gaussians])
+        kappas = tf.cumsum(kappas, axis = 1)
+        seq = tf.range(tf.shape(local_condition_batch)[1])
+        def fn(x):
+            char_weights = alphas*tf.exp(-betas*tf.square(kappas - tf.cast(x, tf.float32)))
+            char_weight = tf.reduce_sum(char_weights, axis=2, keep_dims=True)
+            char_embed = tf.slice(local_condition_batch, [0,x,0], [-1,1,-1])
+            return tf.nn.conv1d(char_weight, char_embed, stride=1, padding="SAME")
+        local_cond_raw = tf.map_fn(fn, seq)
+        local_cond = tf.reduce_sum(local_cond_raw, axis=0)
+        return local_cond
+
     def _generator_conv(self, input_batch, state_batch, weights):
         '''Perform convolution for a single convolutional processing step.'''
         # TODO generalize to filter_width > 2
@@ -392,7 +473,7 @@ class WaveNetModel(object):
 
         return skip_contribution, input_batch + transformed
 
-    def _create_network(self, input_batch, global_condition_batch):
+    def _create_network(self, input_batch, global_condition_batch, local_condition_batch):
         '''Construct the WaveNet network.'''
         outputs = []
         current_layer = input_batch
@@ -415,6 +496,11 @@ class WaveNetModel(object):
                         current_layer, layer_index, dilation,
                         global_condition_batch, output_width)
                     outputs.append(output)
+
+        if self.local_condition_cardinality is not None:
+            with tf.name_scope('lc_layer'):
+                local_cond = self._create_lc_layer(sum(outputs), local_condition_batch)
+
 
         with tf.name_scope('postprocessing'):
             # Perform (+) -> ReLU -> 1x1 conv -> ReLU -> 1x1 conv to
@@ -533,6 +619,16 @@ class WaveNetModel(object):
             encoded = tf.reshape(encoded, shape)
         return encoded
 
+
+    def _embed_lc(self, local_condition):
+        embedding = None
+        if self.local_condition_cardinality is not None:
+            embedding_table = self.variables['embeddings']['lc_embedding']
+            embedding = tf.nn.embedding_lookup(embedding_table,
+                                               local_condition)
+        return embedding
+
+
     def _embed_gc(self, global_condition):
         '''Returns embedding for global condition.
         :param global_condition: Either ID of global condition for
@@ -583,7 +679,7 @@ class WaveNetModel(object):
                 encoded = self._one_hot(waveform)
 
             gc_embedding = self._embed_gc(global_condition)
-            raw_output = self._create_network(encoded, gc_embedding)
+            raw_output = self._create_network(encoded, gc_embedding, None)
             out = tf.reshape(raw_output, [-1, self.quantization_channels])
             # Cast to float64 to avoid bug in TensorFlow
             proba = tf.cast(
@@ -622,6 +718,7 @@ class WaveNetModel(object):
     def loss(self,
              input_batch,
              global_condition_batch=None,
+             local_condition_batch=None,
              l2_regularization_strength=None,
              name='wavenet'):
         '''Creates a WaveNet network and returns the autoencoding loss.
@@ -634,6 +731,7 @@ class WaveNetModel(object):
                                           self.quantization_channels)
 
             gc_embedding = self._embed_gc(global_condition_batch)
+            lc_embedding = self._embed_lc(local_condition_batch)
             encoded = self._one_hot(encoded_input)
             if self.scalar_input:
                 network_input = tf.reshape(
@@ -647,7 +745,7 @@ class WaveNetModel(object):
             network_input = tf.slice(network_input, [0, 0, 0],
                                      [-1, network_input_width, -1])
 
-            raw_output = self._create_network(network_input, gc_embedding)
+            raw_output = self._create_network(network_input, gc_embedding, lc_embedding)
 
             with tf.name_scope('loss'):
                 # Cut off the samples corresponding to the receptive field
