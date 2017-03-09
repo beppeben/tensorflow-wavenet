@@ -221,6 +221,9 @@ def main():
                                                       EPSILON else None
         gc_enabled = args.gc_channels is not None
         lc_enabled = args.lc_channels is not None
+        dilations_lc = []
+        if lc_enabled:
+            dilations_lc = wavenet_params["dilations_lc"]
         reader = AudioReader(
             args.data_dir,
             coord,
@@ -229,6 +232,7 @@ def main():
             lc_enabled=lc_enabled, 
             receptive_field=WaveNetModel.calculate_receptive_field(wavenet_params["filter_width"],
                                                                    wavenet_params["dilations"],
+                                                                   dilations_lc,
                                                                    wavenet_params["scalar_input"],
                                                                    wavenet_params["initial_filter_width"]),
             sample_size=args.sample_size,
@@ -247,6 +251,7 @@ def main():
     net = WaveNetModel(
         batch_size=args.batch_size,
         dilations=wavenet_params["dilations"],
+        dilations_lc=dilations_lc,
         filter_width=wavenet_params["filter_width"],
         residual_channels=wavenet_params["residual_channels"],
         dilation_channels=wavenet_params["dilation_channels"],
