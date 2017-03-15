@@ -10,7 +10,7 @@ import librosa
 import numpy as np
 import tensorflow as tf
 
-from wavenet import WaveNetModel, mu_law_decode, mu_law_encode, audio_reader
+from wavenet import WaveNetModel, mu_law_decode, mu_law_encode, audio_reader, dictionary_cardinality, text_to_ints
 
 SAMPLES = 16000
 TEMPERATURE = 1.0
@@ -95,6 +95,17 @@ def get_arguments():
         type=int,
         default=None,
         help='ID of category to generate, if globally conditioned.')
+    parser.add_argument(
+        '--lc_channels',
+        type=int,
+        default=None,
+        help='Number of local condition embedding channels. Omit if no '
+             'local conditioning.')
+    parser.add_argument(
+        '--lc_text',
+        type=str,
+        default=None,
+        help='The text to use for local conditioning.')
     arguments = parser.parse_args()
     if arguments.gc_channels is not None:
         if arguments.gc_cardinality is None:
@@ -106,7 +117,10 @@ def get_arguments():
             raise ValueError("Globally conditioning, but global condition was "
                               "not specified. Use --gc_id to specify global "
                               "condition.")
-
+    if arguments.lc_channels is not None:
+        if arguments.lc_text is None:
+            raise ValueError("Locally conditioning but lc_text not specified.")
+            
     return arguments
 
 
@@ -138,12 +152,18 @@ def main():
     logdir = os.path.join(args.logdir, 'generate', started_datestring)
     with open(args.wavenet_params, 'r') as config_file:
         wavenet_params = json.load(config_file)
+    
+    lc_enabled = args.lc_channels is not None
+    dilations_lc = []
+    if lc_enabled:
+        dilations_lc = wavenet_params["dilations_lc"]
 
     sess = tf.Session()
 
     net = WaveNetModel(
         batch_size=1,
         dilations=wavenet_params['dilations'],
+        dilations_lc=dilations_lc,
         filter_width=wavenet_params['filter_width'],
         residual_channels=wavenet_params['residual_channels'],
         dilation_channels=wavenet_params['dilation_channels'],
@@ -153,12 +173,15 @@ def main():
         scalar_input=wavenet_params['scalar_input'],
         initial_filter_width=wavenet_params['initial_filter_width'],
         global_condition_channels=args.gc_channels,
-        global_condition_cardinality=args.gc_cardinality)
+        global_condition_cardinality=args.gc_cardinality,
+        local_condition_cardinality=dictionary_cardinality(),
+        local_condition_channels=args.lc_channels,
+        local_condition_gaussians=wavenet_params["lc_gaussians"])
 
     samples = tf.placeholder(tf.int32)
 
     if args.fast_generation:
-        next_sample = net.predict_proba_incremental(samples, args.gc_id)
+        next_sample, weights = net.predict_proba_incremental(samples, args.gc_id, text_to_ints(args.lc_text))
     else:
         next_sample = net.predict_proba(samples, args.gc_id)
 
@@ -206,9 +229,10 @@ def main():
         print('Done.')
 
     last_sample_timestamp = datetime.now()
+    generated_weights = []
     for step in range(args.samples):
         if args.fast_generation:
-            outputs = [next_sample]
+            outputs = [next_sample, weights]
             outputs.extend(net.push_ops)
             window = waveform[-1]
         else:
@@ -219,7 +243,11 @@ def main():
             outputs = [next_sample]
 
         # Run the WaveNet to predict the next sample.
-        prediction = sess.run(outputs, feed_dict={samples: window})[0]
+        outs = sess.run(outputs, feed_dict={samples: window})
+        prediction = outs[0]
+        if args.fast_generation:
+            char_weights = outs[1]
+            generated_weights.append(char_weights)
 
         # Scale prediction distribution using temperature.
         np.seterr(divide='ignore')
@@ -257,6 +285,8 @@ def main():
 
     # Introduce a newline to clear the carriage return from the progress.
     print()
+    
+    np.savetxt('weights.out', generated_weights, delimiter=',')
 
     # Save the result as an audio summary.
     datestring = str(datetime.now()).replace(' ', 'T')

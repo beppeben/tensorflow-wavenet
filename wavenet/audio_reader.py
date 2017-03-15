@@ -8,12 +8,9 @@ import librosa
 import numpy as np
 import tensorflow as tf
 
+from .ops import check_characters, text_to_ints, dictionary_cardinality
+
 FILE_PATTERN = r'p([0-9]+)_([0-9]+)\.wav'
-
-DICTIONARY = 'abcdefghijklmnopqrstuvwxyz.?!,-\' '
-BOS = len(DICTIONARY)  #beginning of sentence
-EOS = BOS + 1  #end of sentence
-
 
 def get_category_cardinality(files):
     id_reg_expression = re.compile(FILE_PATTERN)
@@ -27,29 +24,6 @@ def get_category_cardinality(files):
         if max_id is None or id > max_id:
             max_id = id
     return min_id, max_id
-
-
-def check_characters(files):
-    min_id = None
-    max_id = None
-    for filename in files:
-        text_to_ints(open(filename[1]).read())
-
-
-def strip_text(text):
-    return text.strip().lower().replace("\"", "").replace(")", "").replace("`", "").replace("\t", "")
-
-
-def text_to_ints(text):
-    ints = []
-    ints.append(BOS)
-    for c in strip_text(text):
-        id = DICTIONARY.find(c)
-        if id < 0:
-            raise ValueError("Character not in dictionary :'{}' in '{}'.".format(c, text))
-        ints.append(id)
-    ints.append(EOS)
-    return ints
 
 
 def randomize_files(files):
@@ -134,12 +108,14 @@ class AudioReader(object):
                  lc_enabled,
                  receptive_field,
                  sample_size=None,
+                 max_sample_size = None,
                  silence_threshold=None,
                  queue_size=32):
         self.audio_dir = audio_dir
         self.sample_rate = sample_rate
         self.coord = coord
         self.sample_size = sample_size
+        self.max_sample_size = max_sample_size
         self.receptive_field = receptive_field
         self.silence_threshold = silence_threshold
         self.gc_enabled = gc_enabled
@@ -194,7 +170,7 @@ class AudioReader(object):
 
         if self.lc_enabled:
             check_characters(files)
-            self.lc_character_cardinality = len(DICTIONARY) + 2
+            self.lc_character_cardinality = dictionary_cardinality()
             print("Dictionary cardinality={}".format(
                   self.lc_character_cardinality))
 
@@ -243,7 +219,8 @@ class AudioReader(object):
                         if self.gc_enabled:
                             sess.run(self.gc_enqueue, feed_dict={
                                 self.id_placeholder: category_id})
-                else:
+                                
+                elif self.max_sample_size is None or len(audio)<self.max_sample_size:
                     sess.run(self.enqueue,
                              feed_dict={self.sample_placeholder: audio})
                     if self.gc_enabled:
@@ -252,7 +229,9 @@ class AudioReader(object):
                     if self.lc_enabled:
                         sess.run(self.lc_enqueue,
                                  feed_dict={self.text_placeholder: text_to_ints(text)})
-                print strip_text(text)
+                                 
+                else:
+                    print("Discarding file with text: {}".format(text))
 
 
     def start_threads(self, sess, n_threads=1):

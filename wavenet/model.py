@@ -1,7 +1,7 @@
 import numpy as np
 import tensorflow as tf
 
-from .ops import causal_conv, mu_law_encode
+from .ops import causal_conv, mu_law_encode, text_to_ints
 
 
 def create_variable(name, shape):
@@ -402,6 +402,8 @@ class WaveNetModel(object):
 
         if self.histograms:
             layer = 'layer{}'.format(layer_index)
+            if local_condition_batch is not None:
+                layer = layer + '_lc'
             tf.histogram_summary(layer + '_filter', weights_filter)
             tf.histogram_summary(layer + '_gate', weights_gate)
             tf.histogram_summary(layer + '_dense', weights_dense)
@@ -417,10 +419,70 @@ class WaveNetModel(object):
 
         return skip_contribution, input_batch + transformed
 
-    def _create_lc_layer(self, input_batch, local_condition_batch):
+    def _generate_lc_layer(self, input_batch, local_condition_batch, init_ops, push_ops):
+        if local_condition_batch is None:
+            return None
         lc_weights = self.variables['lc_layer']['lc_gaussian_weights']
         if self.use_biases:
             lc_biases = self.variables['lc_layer']['lc_gaussian_biases']
+        transformed1 = tf.nn.relu(input_batch)
+        raw_params = tf.matmul(transformed1, lc_weights[0, :, :])
+        if self.use_biases:
+            raw_params += lc_biases
+        raw_params = tf.exp(raw_params)
+        alphas = tf.slice(
+            raw_params,
+            [0, 0],
+            [-1, self.local_condition_gaussians])
+        betas = tf.slice(
+            raw_params,
+            [0, self.local_condition_gaussians],
+            [-1, self.local_condition_gaussians])
+        kappas = tf.slice(
+            raw_params,
+            [0, 2*self.local_condition_gaussians],
+            [-1, self.local_condition_gaussians])
+            
+        q = tf.FIFOQueue(
+            1,
+            dtypes=tf.float32,
+            shapes=(self.batch_size, self.local_condition_gaussians))
+        init = q.enqueue_many(
+            tf.zeros((1, self.batch_size,
+                      self.local_condition_gaussians)))
+        current_kappascumul = q.dequeue()
+        kappascumul = current_kappascumul + kappas
+        push = q.enqueue(kappascumul)
+        init_ops.append(init)
+        push_ops.append(push)
+        
+        #local_condition_batch = tf.reshape(local_condition_batch, [1, -1, self.local_condition_channels])
+        seq = tf.range(tf.shape(local_condition_batch)[0])
+        def fn(x):
+            char_weights = alphas*tf.exp(-betas*tf.square(kappascumul - tf.cast(x, tf.float32)))
+            char_weight = tf.reduce_sum(char_weights)
+            return local_condition_batch[x, :]*char_weight
+        local_cond_raw = tf.map_fn(fn, seq, dtype=tf.float32)
+        local_cond = tf.reduce_sum(local_cond_raw, axis=0)
+        
+        def weight(x):
+            char_weights = alphas*tf.exp(-betas*tf.square(kappascumul - tf.cast(x, tf.float32)))
+            char_weight = tf.reduce_sum(char_weights)
+            return char_weight
+        weights = tf.map_fn(weight, seq, dtype=tf.float32)
+        
+        return local_cond, weights
+
+    def _create_lc_layer(self, input_batch, local_condition_batch):
+        if local_condition_batch is None:
+            return None
+        lc_weights = self.variables['lc_layer']['lc_gaussian_weights']
+        if self.use_biases:
+            lc_biases = self.variables['lc_layer']['lc_gaussian_biases']
+        if self.histograms:
+            tf.histogram_summary('gaussian_weights', lc_weights)
+            if self.use_biases:
+                tf.histogram_summary('gaussian_biases', lc_biases)
         transformed1 = tf.nn.relu(input_batch)
         raw_params = tf.nn.conv1d(transformed1, lc_weights, stride=1, padding="SAME")
         if self.use_biases:
@@ -433,17 +495,18 @@ class WaveNetModel(object):
             [-1, self.local_condition_gaussians])
         betas = tf.slice(
             raw_params,
-            [0, self.local_condition_gaussians + 1],
+            [0, self.local_condition_gaussians],
             [-1, self.local_condition_gaussians])
         kappas = tf.slice(
             raw_params,
-            [0, 2*self.local_condition_gaussians + 1],
+            [0, 2*self.local_condition_gaussians],
             [-1, self.local_condition_gaussians])
         alphas = tf.reshape(alphas, [self.batch_size, -1, self.local_condition_gaussians])
         betas = tf.reshape(betas, [self.batch_size, -1, self.local_condition_gaussians])
         kappas = tf.reshape(alphas, [self.batch_size, -1, self.local_condition_gaussians])
         kappas = tf.cumsum(kappas, axis = 1)
         seq = tf.range(tf.shape(local_condition_batch)[1])
+        
         def fn(x):
             char_weights = alphas*tf.exp(-betas*tf.square(kappas - tf.cast(x, tf.float32)))
             char_weight = tf.reduce_sum(char_weights, axis=2, keep_dims=True)
@@ -451,7 +514,26 @@ class WaveNetModel(object):
             return tf.nn.conv1d(char_weight, char_embed, stride=1, padding="SAME")
         local_cond_raw = tf.map_fn(fn, seq, dtype=tf.float32)
         local_cond = tf.reduce_sum(local_cond_raw, axis=0)
-        return local_cond
+        
+        def comp_corr(x):
+            char_weights = alphas*tf.exp(-betas*tf.square(kappas - tf.cast(x, tf.float32)))
+            char_weight = tf.reduce_sum(char_weights, axis=2, keep_dims=False)           
+            char_weight_hi = tf.slice(char_weight, [0,1], [-1,tf.shape(char_weight)[1]-1])
+            char_weight_lo = tf.slice(char_weight, [0,0], [-1,tf.shape(char_weight)[1]-1])
+            char_diffs = char_weight_hi-char_weight_lo
+            mean, var = tf.nn.moments(char_diffs, axes=[1], keep_dims=True)
+            char_diffs_hi = tf.slice(char_diffs, [0,1], [-1,tf.shape(char_diffs)[1]-1])
+            char_diffs_lo = tf.slice(char_diffs, [0,0], [-1,tf.shape(char_diffs)[1]-1])
+            prod = (char_diffs_hi - mean)*(char_diffs_lo - mean)
+            prod_mean = tf.reduce_mean(prod, axis=1, keep_dims=True)
+            corr = prod_mean/var
+            return corr        
+        weights_diffs_corrs = tf.map_fn(comp_corr, seq, dtype=tf.float32)
+        weights_diffs_corrs = tf.reduce_mean(weights_diffs_corrs)
+        tf.summary.scalar('weight_diffs_corrs', weights_diffs_corrs)
+
+        
+        return local_cond, weights_diffs_corrs
 
     def _generator_conv(self, input_batch, state_batch, weights):
         '''Perform convolution for a single convolutional processing step.'''
@@ -470,8 +552,10 @@ class WaveNetModel(object):
         return output
 
     def _generator_dilation_layer(self, input_batch, state_batch, layer_index,
-                                  dilation, global_condition_batch):
+                                  dilation, global_condition_batch, local_condition_batch):
         variables = self.variables['dilated_stack'][layer_index]
+        if local_condition_batch is not None:
+            variables = self.variables['dilated_stack_lc'][layer_index]
 
         weights_filter = variables['filter']
         weights_gate = variables['gate']
@@ -491,7 +575,19 @@ class WaveNetModel(object):
             weights_gc_gate = weights_gc_gate[0, :, :]
             output_gate += tf.matmul(global_condition_batch,
                                      weights_gc_gate)
-
+        
+        if local_condition_batch is not None:
+            local_condition_batch = tf.reshape(local_condition_batch,
+                                                shape=(1, -1))
+            weights_lc_filter = variables['lc_filtweights']
+            weights_lc_filter = weights_lc_filter[0, :, :]
+            output_filter += tf.matmul(local_condition_batch,
+                                       weights_lc_filter)
+            weights_lc_gate = variables['lc_gateweights']
+            weights_lc_gate = weights_lc_gate[0, :, :]
+            output_gate += tf.matmul(local_condition_batch,
+                                     weights_lc_gate)
+        
         if self.use_biases:
             output_filter = output_filter + variables['filter_bias']
             output_gate = output_gate + variables['gate_bias']
@@ -534,10 +630,8 @@ class WaveNetModel(object):
                         global_condition_batch, output_width)
                     outputs.append(output)
         
-        local_cond = None
-        if self.local_condition_cardinality is not None:
-            with tf.name_scope('lc_layer'):
-                local_cond = self._create_lc_layer(sum(outputs), local_condition_batch)
+        with tf.name_scope('lc_layer'):
+            local_cond, weights_diffs_corrs = self._create_lc_layer(sum(outputs), local_condition_batch)
         
         # Add all post local conditioning dilation layers.
         with tf.name_scope('dilated_stack_lc'):
@@ -576,9 +670,9 @@ class WaveNetModel(object):
             if self.use_biases:
                 conv2 = tf.add(conv2, b2)
 
-        return conv2
+        return conv2, weights_diffs_corrs
 
-    def _create_generator(self, input_batch, global_condition_batch):
+    def _create_generator(self, input_batch, global_condition_batch, local_condition_batch):
         '''Construct an efficient incremental generator.'''
         init_ops = []
         push_ops = []
@@ -604,7 +698,6 @@ class WaveNetModel(object):
         with tf.name_scope('dilated_stack'):
             for layer_index, dilation in enumerate(self.dilations):
                 with tf.name_scope('layer{}'.format(layer_index)):
-
                     q = tf.FIFOQueue(
                         dilation,
                         dtypes=tf.float32,
@@ -620,8 +713,33 @@ class WaveNetModel(object):
 
                     output, current_layer = self._generator_dilation_layer(
                         current_layer, current_state, layer_index, dilation,
-                        global_condition_batch)
+                        global_condition_batch, None)
                     outputs.append(output)
+        
+        with tf.name_scope('lc_layer'):
+            local_cond, weights = self._generate_lc_layer(sum(outputs), local_condition_batch, init_ops, push_ops)
+        
+        with tf.name_scope('dilated_stack_lc'):
+            for layer_index, dilation in enumerate(self.dilations_lc):
+                with tf.name_scope('layer{}'.format(layer_index)):
+                    q = tf.FIFOQueue(
+                        dilation,
+                        dtypes=tf.float32,
+                        shapes=(self.batch_size, self.residual_channels))
+                    init = q.enqueue_many(
+                        tf.zeros((dilation, self.batch_size,
+                                  self.residual_channels)))
+
+                    current_state = q.dequeue()
+                    push = q.enqueue([current_layer])
+                    init_ops.append(init)
+                    push_ops.append(push)
+
+                    output, current_layer = self._generator_dilation_layer(
+                        current_layer, current_state, layer_index, dilation,
+                        global_condition_batch, local_cond)
+                    outputs.append(output)            
+                    
         self.init_ops = init_ops
         self.push_ops = push_ops
 
@@ -648,7 +766,7 @@ class WaveNetModel(object):
             if self.use_biases:
                 conv2 = conv2 + b2
 
-        return conv2
+        return conv2, weights
 
     def _one_hot(self, input_batch):
         '''One-hot encodes the waveform amplitudes.
@@ -725,7 +843,7 @@ class WaveNetModel(object):
                 encoded = self._one_hot(waveform)
 
             gc_embedding = self._embed_gc(global_condition)
-            raw_output = self._create_network(encoded, gc_embedding, None)
+            raw_output, _ = self._create_network(encoded, gc_embedding, None)
             out = tf.reshape(raw_output, [-1, self.quantization_channels])
             # Cast to float64 to avoid bug in TensorFlow
             proba = tf.cast(
@@ -737,7 +855,7 @@ class WaveNetModel(object):
             return tf.reshape(last, [-1])
 
     def predict_proba_incremental(self, waveform, global_condition=None,
-                                  name='wavenet'):
+                                  local_condition=None, name='wavenet'):
         '''Computes the probability distribution of the next sample
         incrementally, based on a single sample and all previously passed
         samples.'''
@@ -751,7 +869,8 @@ class WaveNetModel(object):
             encoded = tf.one_hot(waveform, self.quantization_channels)
             encoded = tf.reshape(encoded, [-1, self.quantization_channels])
             gc_embedding = self._embed_gc(global_condition)
-            raw_output = self._create_generator(encoded, gc_embedding)
+            lc_embedding = self._embed_lc(local_condition)
+            raw_output, weights = self._create_generator(encoded, gc_embedding, lc_embedding)
             out = tf.reshape(raw_output, [-1, self.quantization_channels])
             proba = tf.cast(
                 tf.nn.softmax(tf.cast(out, tf.float64)), tf.float32)
@@ -759,7 +878,7 @@ class WaveNetModel(object):
                 proba,
                 [tf.shape(proba)[0] - 1, 0],
                 [1, self.quantization_channels])
-            return tf.reshape(last, [-1])
+            return tf.reshape(last, [-1]), weights
 
     def loss(self,
              input_batch,
@@ -791,7 +910,7 @@ class WaveNetModel(object):
             network_input = tf.slice(network_input, [0, 0, 0],
                                      [-1, network_input_width, -1])
 
-            raw_output = self._create_network(network_input, gc_embedding, lc_embedding)
+            raw_output, weights_diffs_corrs = self._create_network(network_input, gc_embedding, lc_embedding)
 
             with tf.name_scope('loss'):
                 # Cut off the samples corresponding to the receptive field
@@ -812,6 +931,8 @@ class WaveNetModel(object):
                 reduced_loss = tf.reduce_mean(loss)
 
                 tf.summary.scalar('loss', reduced_loss)
+                
+                reduced_loss = reduced_loss - 0.01*weights_diffs_corrs
 
                 if l2_regularization_strength is None:
                     return reduced_loss

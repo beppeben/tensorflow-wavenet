@@ -2,6 +2,36 @@ from __future__ import division
 
 import tensorflow as tf
 
+DICTIONARY = 'abcdefghijklmnopqrstuvwxyz.?!,-\' '
+BOS = len(DICTIONARY)  #beginning of sentence
+EOS = BOS + 1  #end of sentence
+
+def dictionary_cardinality():
+    return len(DICTIONARY) + 2
+
+def check_characters(files):
+    min_id = None
+    max_id = None
+    for filename in files:
+        text_to_ints(open(filename[1]).read())
+
+
+def strip_text(text):
+    return text.strip().lower().replace("\"", "").replace(")", "").replace("`", "").replace("\t", "")
+
+
+def text_to_ints(text):
+    if text is None:
+        return None
+    ints = []
+    ints.append(BOS)
+    for c in strip_text(text):
+        id = DICTIONARY.find(c)
+        if id < 0:
+            raise ValueError("Character not in dictionary :'{}' in '{}'.".format(c, text))
+        ints.append(id)
+    ints.append(EOS)
+    return ints
 
 def create_adam_optimizer(learning_rate, momentum):
     return tf.train.AdamOptimizer(learning_rate=learning_rate,
