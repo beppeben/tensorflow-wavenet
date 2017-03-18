@@ -429,7 +429,7 @@ class WaveNetModel(object):
         raw_params = tf.matmul(transformed1, lc_weights[0, :, :])
         if self.use_biases:
             raw_params += lc_biases
-        raw_params = tf.exp(raw_params)
+        raw_params = tf.nn.relu(raw_params)
         alphas = tf.slice(
             raw_params,
             [0, 0],
@@ -456,7 +456,6 @@ class WaveNetModel(object):
         init_ops.append(init)
         push_ops.append(push)
         
-        #local_condition_batch = tf.reshape(local_condition_batch, [1, -1, self.local_condition_channels])
         seq = tf.range(tf.shape(local_condition_batch)[0])
         def fn(x):
             char_weights = alphas*tf.exp(-betas*tf.square(kappascumul - tf.cast(x, tf.float32)))
@@ -488,7 +487,7 @@ class WaveNetModel(object):
         if self.use_biases:
             raw_params += lc_biases
         raw_params = tf.reshape(raw_params, [-1, 3*self.local_condition_gaussians])
-        raw_params = tf.exp(raw_params)
+        raw_params = tf.nn.relu(raw_params)
         alphas = tf.slice(
             raw_params,
             [0, 0],
@@ -503,7 +502,7 @@ class WaveNetModel(object):
             [-1, self.local_condition_gaussians])
         alphas = tf.reshape(alphas, [self.batch_size, -1, self.local_condition_gaussians])
         betas = tf.reshape(betas, [self.batch_size, -1, self.local_condition_gaussians])
-        kappas = tf.reshape(alphas, [self.batch_size, -1, self.local_condition_gaussians])
+        kappas = tf.reshape(kappas, [self.batch_size, -1, self.local_condition_gaussians])
         kappas = tf.cumsum(kappas, axis = 1)
         seq = tf.range(tf.shape(local_condition_batch)[1])
         
@@ -515,6 +514,8 @@ class WaveNetModel(object):
         local_cond_raw = tf.map_fn(fn, seq, dtype=tf.float32)
         local_cond = tf.reduce_sum(local_cond_raw, axis=0)
         
+        # test to compute correlations of char weight differences in time,
+        #    to try regularization based on it
         def comp_corr(x):
             char_weights = alphas*tf.exp(-betas*tf.square(kappas - tf.cast(x, tf.float32)))
             char_weight = tf.reduce_sum(char_weights, axis=2, keep_dims=False)           
@@ -531,9 +532,9 @@ class WaveNetModel(object):
         weights_diffs_corrs = tf.map_fn(comp_corr, seq, dtype=tf.float32)
         weights_diffs_corrs = tf.reduce_mean(weights_diffs_corrs)
         tf.summary.scalar('weight_diffs_corrs', weights_diffs_corrs)
-
         
-        return local_cond, weights_diffs_corrs
+        
+        return local_cond
 
     def _generator_conv(self, input_batch, state_batch, weights):
         '''Perform convolution for a single convolutional processing step.'''
@@ -608,7 +609,8 @@ class WaveNetModel(object):
 
     def _create_network(self, input_batch, global_condition_batch, local_condition_batch):
         '''Construct the WaveNet network.'''
-        outputs = []
+        outputs_dilated = []
+        outputs_dilated_lc = []
         current_layer = input_batch
 
         # Pre-process the input with a regular convolution
@@ -618,6 +620,7 @@ class WaveNetModel(object):
             initial_channels = self.quantization_channels
 
         current_layer = self._create_causal_layer(current_layer)
+        base_layer = current_layer
 
         output_width = tf.shape(input_batch)[1] - self.receptive_field + 1
 
@@ -628,19 +631,20 @@ class WaveNetModel(object):
                     output, current_layer = self._create_dilation_layer(
                         current_layer, layer_index, dilation,
                         global_condition_batch, output_width)
-                    outputs.append(output)
+                    outputs_dilated.append(output)
         
         with tf.name_scope('lc_layer'):
-            local_cond, weights_diffs_corrs = self._create_lc_layer(sum(outputs), local_condition_batch)
-        
+            local_cond = self._create_lc_layer(sum(outputs_dilated), local_condition_batch)
+              
         # Add all post local conditioning dilation layers.
+        current_layer = base_layer
         with tf.name_scope('dilated_stack_lc'):
             for layer_index, dilation in enumerate(self.dilations_lc):
                 with tf.name_scope('layer{}'.format(layer_index)):
                     output, current_layer = self._create_dilation_layer(
                         current_layer, layer_index, dilation,
                         global_condition_batch, output_width, local_cond)
-                    outputs.append(output)
+                    outputs_dilated_lc.append(output)
         
         with tf.name_scope('postprocessing'):
             # Perform (+) -> ReLU -> 1x1 conv -> ReLU -> 1x1 conv to
@@ -660,7 +664,7 @@ class WaveNetModel(object):
 
             # We skip connections from the outputs of each layer, adding them
             # all up here.
-            total = sum(outputs)
+            total = sum(outputs_dilated_lc)
             transformed1 = tf.nn.relu(total)
             conv1 = tf.nn.conv1d(transformed1, w1, stride=1, padding="SAME")
             if self.use_biases:
@@ -670,13 +674,14 @@ class WaveNetModel(object):
             if self.use_biases:
                 conv2 = tf.add(conv2, b2)
 
-        return conv2, weights_diffs_corrs
+        return conv2
 
     def _create_generator(self, input_batch, global_condition_batch, local_condition_batch):
         '''Construct an efficient incremental generator.'''
         init_ops = []
         push_ops = []
-        outputs = []
+        outputs_dilated = []
+        outputs_dilated_lc = []
         current_layer = input_batch
 
         q = tf.FIFOQueue(
@@ -693,6 +698,7 @@ class WaveNetModel(object):
 
         current_layer = self._generator_causal_layer(
                             current_layer, current_state)
+        base_layer = current_layer
 
         # Add all defined dilation layers.
         with tf.name_scope('dilated_stack'):
@@ -714,11 +720,12 @@ class WaveNetModel(object):
                     output, current_layer = self._generator_dilation_layer(
                         current_layer, current_state, layer_index, dilation,
                         global_condition_batch, None)
-                    outputs.append(output)
+                    outputs_dilated.append(output)
         
         with tf.name_scope('lc_layer'):
-            local_cond, weights = self._generate_lc_layer(sum(outputs), local_condition_batch, init_ops, push_ops)
+            local_cond, weights = self._generate_lc_layer(sum(outputs_dilated), local_condition_batch, init_ops, push_ops)
         
+        current_layer = base_layer
         with tf.name_scope('dilated_stack_lc'):
             for layer_index, dilation in enumerate(self.dilations_lc):
                 with tf.name_scope('layer{}'.format(layer_index)):
@@ -738,7 +745,7 @@ class WaveNetModel(object):
                     output, current_layer = self._generator_dilation_layer(
                         current_layer, current_state, layer_index, dilation,
                         global_condition_batch, local_cond)
-                    outputs.append(output)            
+                    outputs_dilated_lc.append(output)            
                     
         self.init_ops = init_ops
         self.push_ops = push_ops
@@ -755,7 +762,7 @@ class WaveNetModel(object):
 
             # We skip connections from the outputs of each layer, adding them
             # all up here.
-            total = sum(outputs)
+            total = sum(outputs_dilated_lc)
             transformed1 = tf.nn.relu(total)
 
             conv1 = tf.matmul(transformed1, w1[0, :, :])
@@ -843,7 +850,7 @@ class WaveNetModel(object):
                 encoded = self._one_hot(waveform)
 
             gc_embedding = self._embed_gc(global_condition)
-            raw_output, _ = self._create_network(encoded, gc_embedding, None)
+            raw_output = self._create_network(encoded, gc_embedding, None)
             out = tf.reshape(raw_output, [-1, self.quantization_channels])
             # Cast to float64 to avoid bug in TensorFlow
             proba = tf.cast(
@@ -910,7 +917,7 @@ class WaveNetModel(object):
             network_input = tf.slice(network_input, [0, 0, 0],
                                      [-1, network_input_width, -1])
 
-            raw_output, weights_diffs_corrs = self._create_network(network_input, gc_embedding, lc_embedding)
+            raw_output = self._create_network(network_input, gc_embedding, lc_embedding)
 
             with tf.name_scope('loss'):
                 # Cut off the samples corresponding to the receptive field
@@ -931,8 +938,6 @@ class WaveNetModel(object):
                 reduced_loss = tf.reduce_mean(loss)
 
                 tf.summary.scalar('loss', reduced_loss)
-                
-                reduced_loss = reduced_loss - 0.01*weights_diffs_corrs
 
                 if l2_regularization_strength is None:
                     return reduced_loss

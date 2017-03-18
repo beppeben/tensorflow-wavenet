@@ -8,7 +8,7 @@
     "residual_channels": 16,
     "dilation_channels": 16,
     "quantization_channels": 16,
-    "lc_gaussians": 10,
+    "lc_gaussians": 4,
     "skip_channels": 16,
     "use_biases": true,
     "scalar_input": false,

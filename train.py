@@ -30,7 +30,7 @@ STARTED_DATESTRING = "{0:%Y-%m-%dT%H-%M-%S}".format(datetime.now())
 SAMPLE_SIZE = 100000
 MAX_SAMPLE_SIZE = 20000
 L2_REGULARIZATION_STRENGTH = 0
-SILENCE_THRESHOLD = 0.3
+SILENCE_THRESHOLD = 0.1
 EPSILON = 0.001
 MOMENTUM = 0.9
 MAX_TO_KEEP = 5
@@ -342,7 +342,6 @@ def main():
             duration = time.time() - start_time
             print('step {:d} - loss = {:.3f}, ({:.3f} sec/step)'
                   .format(step, loss_value, duration))
-            tf.summary.scalar('loss', loss_value)
 
             if step % args.checkpoint_every == 0:
                 save(saver, sess, logdir, step)
