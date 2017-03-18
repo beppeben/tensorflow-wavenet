@@ -264,11 +264,11 @@ class WaveNetModel(object):
                         'lc_gaussian_weights',
                         [1,
                          self.skip_channels,
-                         3*self.local_condition_gaussians])                 
+                         2*self.local_condition_gaussians])                 
                     if self.use_biases:
                         current['lc_gaussian_biases'] = create_bias_variable(
                             'lc_gaussian_biases', 
-                            [3*self.local_condition_gaussians])
+                            [2*self.local_condition_gaussians])
                     var['lc_layer'] = current
                     
             var['dilated_stack_lc'] = list()
@@ -430,17 +430,13 @@ class WaveNetModel(object):
         if self.use_biases:
             raw_params += lc_biases
         raw_params = tf.nn.relu(raw_params)
-        alphas = tf.slice(
+        betas = tf.slice(
             raw_params,
             [0, 0],
             [-1, self.local_condition_gaussians])
-        betas = tf.slice(
-            raw_params,
-            [0, self.local_condition_gaussians],
-            [-1, self.local_condition_gaussians])
         kappas = tf.slice(
             raw_params,
-            [0, 2*self.local_condition_gaussians],
+            [0, self.local_condition_gaussians],
             [-1, self.local_condition_gaussians])
             
         q = tf.FIFOQueue(
@@ -458,14 +454,14 @@ class WaveNetModel(object):
         
         seq = tf.range(tf.shape(local_condition_batch)[0])
         def fn(x):
-            char_weights = alphas*tf.exp(-betas*tf.square(kappascumul - tf.cast(x, tf.float32)))
+            char_weights = tf.exp(-betas*tf.square(kappascumul - tf.cast(x, tf.float32)))
             char_weight = tf.reduce_sum(char_weights)
             return local_condition_batch[x, :]*char_weight
         local_cond_raw = tf.map_fn(fn, seq, dtype=tf.float32)
         local_cond = tf.reduce_sum(local_cond_raw, axis=0)
         
         def weight(x):
-            char_weights = alphas*tf.exp(-betas*tf.square(kappascumul - tf.cast(x, tf.float32)))
+            char_weights = tf.exp(-betas*tf.square(kappascumul - tf.cast(x, tf.float32)))
             char_weight = tf.reduce_sum(char_weights)
             return char_weight
         weights = tf.map_fn(weight, seq, dtype=tf.float32)
@@ -486,38 +482,34 @@ class WaveNetModel(object):
         raw_params = tf.nn.conv1d(transformed1, lc_weights, stride=1, padding="SAME")
         if self.use_biases:
             raw_params += lc_biases
-        raw_params = tf.reshape(raw_params, [-1, 3*self.local_condition_gaussians])
+        raw_params = tf.reshape(raw_params, [-1, 2*self.local_condition_gaussians])
         raw_params = tf.nn.relu(raw_params)
-        alphas = tf.slice(
+        betas = tf.slice(
             raw_params,
             [0, 0],
             [-1, self.local_condition_gaussians])
-        betas = tf.slice(
+        kappas = tf.slice(
             raw_params,
             [0, self.local_condition_gaussians],
             [-1, self.local_condition_gaussians])
-        kappas = tf.slice(
-            raw_params,
-            [0, 2*self.local_condition_gaussians],
-            [-1, self.local_condition_gaussians])
-        alphas = tf.reshape(alphas, [self.batch_size, -1, self.local_condition_gaussians])
         betas = tf.reshape(betas, [self.batch_size, -1, self.local_condition_gaussians])
         kappas = tf.reshape(kappas, [self.batch_size, -1, self.local_condition_gaussians])
         kappas = tf.cumsum(kappas, axis = 1)
         seq = tf.range(tf.shape(local_condition_batch)[1])
         
         def fn(x):
-            char_weights = alphas*tf.exp(-betas*tf.square(kappas - tf.cast(x, tf.float32)))
+            char_weights = tf.exp(-betas*tf.square(kappas - tf.cast(x, tf.float32)))
             char_weight = tf.reduce_sum(char_weights, axis=2, keep_dims=True)
             char_embed = tf.slice(local_condition_batch, [0,x,0], [-1,1,-1])
             return tf.nn.conv1d(char_weight, char_embed, stride=1, padding="SAME")
         local_cond_raw = tf.map_fn(fn, seq, dtype=tf.float32)
         local_cond = tf.reduce_sum(local_cond_raw, axis=0)
         
-        # test to compute correlations of char weight differences in time,
-        #    to try regularization based on it
+        '''
+        test to compute correlations of char weight differences in time,
+            to try regularization based on it
         def comp_corr(x):
-            char_weights = alphas*tf.exp(-betas*tf.square(kappas - tf.cast(x, tf.float32)))
+            char_weights = tf.exp(-betas*tf.square(kappas - tf.cast(x, tf.float32)))
             char_weight = tf.reduce_sum(char_weights, axis=2, keep_dims=False)           
             char_weight_hi = tf.slice(char_weight, [0,1], [-1,tf.shape(char_weight)[1]-1])
             char_weight_lo = tf.slice(char_weight, [0,0], [-1,tf.shape(char_weight)[1]-1])
@@ -532,7 +524,7 @@ class WaveNetModel(object):
         weights_diffs_corrs = tf.map_fn(comp_corr, seq, dtype=tf.float32)
         weights_diffs_corrs = tf.reduce_mean(weights_diffs_corrs)
         tf.summary.scalar('weight_diffs_corrs', weights_diffs_corrs)
-        
+        '''
         
         return local_cond
 
