@@ -28,9 +28,9 @@ LEARNING_RATE = 1e-3
 WAVENET_PARAMS = './wavenet_params.json'
 STARTED_DATESTRING = "{0:%Y-%m-%dT%H-%M-%S}".format(datetime.now())
 SAMPLE_SIZE = 100000
-MAX_SAMPLE_SIZE = 20000
+MAX_SAMPLE_SIZE = 200000
 L2_REGULARIZATION_STRENGTH = 0
-SILENCE_THRESHOLD = 0.1
+SILENCE_THRESHOLD = 0.2
 EPSILON = 0.001
 MOMENTUM = 0.9
 MAX_TO_KEEP = 5
@@ -83,7 +83,7 @@ def get_arguments():
                         help='Concatenate and cut audio samples to this many '
                         'samples. Default: ' + str(SAMPLE_SIZE) + '.')
     parser.add_argument('--max_sample_size', type=int, default=MAX_SAMPLE_SIZE,
-                        help='Maximum sample size to use, when --sample_size=0. '
+                        help='Maximum sample size to use with lc, discarding inputs with greater size. '
                         'Default: ' + str(MAX_SAMPLE_SIZE) + '.')
     parser.add_argument('--l2_regularization_strength', type=float,
                         default=L2_REGULARIZATION_STRENGTH,

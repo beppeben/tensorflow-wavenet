@@ -245,9 +245,13 @@ def main():
         # Run the WaveNet to predict the next sample.
         outs = sess.run(outputs, feed_dict={samples: window})
         prediction = outs[0]
-        if args.fast_generation:
+        if args.fast_generation and lc_enabled:
             char_weights = outs[1]
             generated_weights.append(char_weights)
+            if char_weights[-1] > char_weights[-2]:
+                # stopping when the 'end of sentence' weight dominates
+                print('Stopping at sample {:3<d}'.format(step), end='\r')
+                break
 
         # Scale prediction distribution using temperature.
         np.seterr(divide='ignore')
@@ -286,7 +290,7 @@ def main():
     # Introduce a newline to clear the carriage return from the progress.
     print()
     
-    np.savetxt('weights.out', generated_weights, delimiter=',')
+    np.savetxt('char_weights.out', generated_weights, delimiter=',')
 
     # Save the result as an audio summary.
     datestring = str(datetime.now()).replace(' ', 'T')
